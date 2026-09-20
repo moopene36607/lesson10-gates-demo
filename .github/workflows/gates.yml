@@ -1,0 +1,90 @@
+name: Gates
+# 堂 10 幕 3/5/6：硬性關卡（gate）。這條 workflow 裡的每一個 job 都『能擋 merge』——
+# 退出碼非 0 → CI 紅燈 → 接上 branch protection → merge 按鈕變灰。
+#
+# 這條 workflow 裡有兩類檢查，跟 claude-review.yml 的「AI 意見」是三回事：
+#   - AI 意見（claude-review.yml）幫你『看見』，但不擋。
+#   - 讀 AI 結論的機械化檢查（站 3 severity-gate）：執行確定性、輸入來自 AI；紅燈可擋，綠燈只代表 AI 沒報。
+#   - 不依賴 AI 的確定性檢查（站 1 tasks-lint、站 2 pytest）：只看你寫下的條件，是不靠 AI 的底線。
+#
+# 核心示範：同一支 tasks_lint.py，堂 2 手跑 → 堂 3 掛 hook → 堂 10 進 CI。
+#           三個位置共用同一套判定；退出碼各宿主自己翻譯：linter 1 → hook 2 → CI 非零。
+#
+# 供應鏈：@v6 / @v5 這種 tag 可以被移動；正式環境請釘完整 commit SHA（GitHub secure-use 頁）。
+# 這條鏈的另一半：gate 讀的 tasks.md、測試、gate 腳本、連本檔自己，都在 PR 分支裡，
+# pull_request 跑的是含 PR 改動的那一版；branch protection 要勾「Do not allow bypassing the above settings」。
+on:
+  pull_request:
+    types: [opened, synchronize]
+  push:
+    branches: [main, master]
+
+# gate job 只需要讀 code。刻意不給任何寫入權（堂 10.5 最小權限）。
+permissions:
+  contents: read
+
+jobs:
+  # ── 站 1：確定性 linter —— tasks_lint.py 的第三個位置 ──────────────
+  tasks-lint:
+    runs-on: ubuntu-latest
+    steps:
+      # ⚠️ pull_request 預設 checkout 的是 PR 的 merge commit：本檔、tasks_lint.py、tests/ 都是含 PR 改動的那一版，
+      #    PR 自己就能改掉 gate（三個 job 都一樣）。補法：CODEOWNERS 人審／治理程式放受保護的 reusable workflow 或獨立 repo，堂 11 講。
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 並行安全性 lint（堂 2 手跑 → 堂 3 hook → 堂 10 CI，同一套判定，第三個位置）
+        run: |
+          shopt -s globstar nullglob
+          found=0
+          for f in specs/**/tasks.md tasks.md; do
+            [ -e "$f" ] || continue
+            found=1
+            echo "::group::tasks_lint $f"
+            # 退出碼 1 = 有並行衝突 → set -e 讓整條 CI 紅燈（gate）
+            python tasks_lint.py "$f"
+            echo "::endgroup::"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "（沒有 tasks.md 可 lint —— 本站略過，不視為失敗）"
+          fi
+        shell: bash
+
+  # ── 站 2：pytest —— 受測者碰不到的 runner 上跑真實測試 ────────────
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝依賴
+        run: pip install -q fastapi "httpx>=0.27" pytest
+      - name: pytest（紅燈 = 擋 merge）
+        # 幕 6 的壞 commit（把 issue_id: int 改回無型別）會讓 test_get_by_id 在這裡紅。
+        run: python -m pytest -q
+
+  # ── 站 3：把 AI 審查的嚴重度變成一道會擋的 gate ──────────────────
+  # 託管 Code Review 的 check run 恆為 neutral、不擋 merge → 這個 job 讀它的
+  # bughunter-severity，Important > 0 就 exit 1。這是「AI 看見、gate 擋住」的接點。
+  # 它的執行是確定性的，但判斷來源仍是 AI：紅燈可擋，綠燈只代表 AI 沒報。
+  severity-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 讀嚴重度 → Important > 0 就擋
+        # 教學 / 免費方案：讀預錄的 severity.green.json（確定性、不誤擋）。
+        #
+        # 真實（Team/Enterprise 啟用託管 Code Review 後）改成讀真的 check run，還要三件事：
+        #   1) 這個 job 要等「Claude Code Review」在同一個 commit 上跑完才有東西可讀（自己輪詢）；
+        #   2) 這個 step 加 env: GH_TOKEN: ${{ github.token }}，gh api 才有身分；
+        #   3) private repo 的 permissions 要加 checks: read（本檔頂部只給 contents: read）。
+        #   gh api repos/${{ github.repository }}/check-runs/$CHECK_RUN_ID \
+        #     --jq '.output.text | split("bughunter-severity: ")[1] | split(" -->")[0] | fromjson' \
+        #     | python gate_from_severity.py -
+        # 或用 gate_from_severity.sh --repo ${{ github.repository }} --check-run-id <id>
+        run: python gate_from_severity.py severity.green.json
