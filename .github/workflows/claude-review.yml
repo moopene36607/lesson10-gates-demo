@@ -1,0 +1,71 @@
+name: Claude Code Review
+# 堂 10 幕 1–2：軟性 AI 審查。每個 PR 自動跑 Claude，把問題貼成 inline comment。
+#
+# 這是三類檢查裡的「AI 意見」—— 它幫你看見問題，但它『不擋』merge。
+# 能擋的是另一條 workflow（gates.yml）裡的檢查。別搞混這兩者。
+#
+# claude-code-action@v1 就是你終端機裡的 `claude`，被搬進 GitHub runner。
+#   - mode 自動偵測：給了 prompt = automation（一觸發就跑）。
+#   - claude_args 透傳任何 CLI 旗標。
+#
+# 供應鏈：@v1 / @v6 這種 tag 可以被移動；正式環境請釘完整 commit SHA，用 Dependabot 更新
+#（GitHub secure-use 頁）。教材為了好讀留 tag。
+# 下面那組 allowedTools 能成為邊界的前提：base branch 沒有 hook、沒給 settings。另注意 allowedTools 只管
+# 「哪些免問」：Claude Code 內建的唯讀指令（ls、cat、git 的唯讀形式）本來就不必放行（permissions 頁
+# Read-only commands；本機 v2.1.280 實測 -p 下 git log／git diff 照跑，echo $VAR、printenv、env、touch 被拒）。官方 action
+# 會把 .claude/、.mcp.json、CLAUDE.md 等固定路徑還原成 base branch 版本，其餘檔案停在 PR head；
+# base branch 的 hook 若跑 npm run / make，解析到的就是 PR 帶來的檔案（claude-code-action docs/security.md）。
+on:
+  pull_request:
+    # 觸發的取捨：保留 synchronize。壞 commit 常是後來才推上同一個 PR 的（幕 6 就是），只在 opened 時審，
+    # 後推的 commit 沒人看。代價是每 push 一次就重審一次、重貼一次 comment、再付一次錢。
+    # 去重要讀既有 comment 的工具，本檔刻意不給（gh pr view、gh api 的 --jq 都讀得到 $ENV，見下方 allowedTools 註解）。
+    # 想省錢就改 types: [opened, ready_for_review, reopened]，重審靠人手動重跑。
+    types: [opened, synchronize]
+
+# 成本煞車之一：同一個 PR 同時只跑一次審查；新 push 進來就取消還在跑的舊審查（它審的是舊 code）。
+# 寫成一行 flow 樣式；${{ }} 含大括號，group 一定要加引號。
+concurrency: { group: "${{ github.workflow }}-${{ github.event.pull_request.number }}", cancel-in-progress: true }
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10       # 成本煞車之二：一次 run 最多 10 分鐘（之三是下面 claude_args 的 --max-turns）
+    # 最小權限集合 —— 這是 CI 安全的第一道防線（堂 10.5）。管的是 GITHUB_TOKEN，不是 Claude 手上那把 App token：
+    # action 用 OIDC 換來 App token、設成 Claude 行程的 GITHUB_TOKEN／GH_TOKEN，那把能寫（reference.md 第 36 條）；
+    # 擋 Claude 推 commit 的是下面 claude_args 的 --allowedTools。
+    # 寫了任何一項，沒寫到的全部變 none（GitHub 規則）。與官方 review 範例相同。
+    permissions:
+      contents: read          # 只讀，不寫 code（沒有 contents: write）
+      pull-requests: read     # 讀 PR；貼 comment 走 Claude GitHub App 的身分，不靠這把 token
+      issues: read
+      id-token: write         # 讓 action 換到 Claude GitHub App 的身分（官方：預設認證的必要條件）
+    steps:
+      - uses: actions/checkout@v6
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}   # demo repo 版：兩個 secret 設其中一個即可
+          # automation 模式把這段 prompt 原封不動交給 Claude，不會自己附上是哪個 PR、改了哪幾行
+          # （action 原始碼 src/modes/agent/index.ts；官方 docs/solutions.md：Always include REPO and PR NUMBER）。
+          # checkout 下來的是 merge commit（fetch-depth 1），本機 git 算不出 diff，所以要給它 gh pr diff。
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            你是獨立審查者，只審不改。先用 gh pr diff 看這個 PR 改了哪幾行，
+            再審正確性、404/錯誤處理、path 參數型別註記、以及 response_model 是否齊全。
+            具體問題以 inline review comment 貼在 diff 的對應行；沒問題就簡短說明。
+          # 審查者只給讀的能力：讀檔、搜尋、看 diff，外加貼意見 —— 與堂 5 reviewer subagent 不給 Edit、
+          # 堂 9 codex --sandbox read-only 同一條「審查者唯讀」原則。
+          # Bash 只放行 gh pr diff 一個子指令（官方範例寫 Bash(gh pr diff:*)，
+          # permissions 頁：`:*` 等同尾端的 ` *`；本堂講稿 10.4 教的是空格寫法，這裡跟講稿一致）。
+          # 刻意不放行官方範例裡的 gh pr view：它的 --jq 用 gojq，讀得到環境變數 $ENV
+          #（講者 2026-09-28 以 gh 2.98.0 實測：gh pr view N --json number --jq '$ENV.FOO' 會印出 FOO 的值），
+          # 而 action 把能寫的 Claude GitHub App token 放在 GH_TOKEN。被注入的 Claude 可以把它印出來、再貼成 comment。
+          # gh pr diff 沒有 --jq／--template 這類旗標（gh pr diff --help，2026-09-28）。
+          # 貼 inline comment 的 MCP server，只在 --allowedTools 點名它時 action 才會開；
+          # 沒點名，prompt 寫「貼成 inline comment」也貼不出去，結果只留在 run log。
+          claude_args: |
+            --max-turns 8
+            --model claude-sonnet-5
+            --allowedTools "Read,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff *)"
