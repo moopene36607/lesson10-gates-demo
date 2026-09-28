@@ -22,7 +22,7 @@ def list_issues() -> list[Issue]:
 
 
 @app.get("/issues/{issue_id}", response_model=Issue)
-def get_issue(issue_id: int) -> Issue:
+def get_issue(issue_id) -> Issue:
     """依 id 取單一 issue；找不到回 404。"""
     issue = store.get(issue_id)
     if issue is None:
