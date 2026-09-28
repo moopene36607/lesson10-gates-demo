@@ -1,0 +1,7 @@
+# 堂 10：gate 讀的檔案要有人審，PR 才改不掉 gate 本身。
+# 搭配 branch protection 勾「Require review from Code Owners」才生效。
+/.github/CODEOWNERS      @moopene36607
+/.github/workflows/      @moopene36607
+/gate_from_severity.*    @moopene36607
+/tasks_lint.py           @moopene36607
+/tests/                  @moopene36607
